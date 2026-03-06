@@ -2,8 +2,8 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Care Coach Rivi — Guardian Protocol Edition",
-  description: "MVP for guardian protocol playback and caregiver clarification"
+  title: "Rivi Care Coach",
+  description: "Family-friendly care guidance with guardian setup and caregiver playback"
 };
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {

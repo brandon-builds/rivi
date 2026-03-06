@@ -1,38 +1,43 @@
 "use client";
 
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
-import { AppHeader } from "@/components/AppHeader";
-import { ProtocolStore } from "@/lib/stores/protocolStore";
+import { GuardianStepStore } from "@/lib/stores/guardianStepStore";
 
-export default function CaregiverStartPage() {
-  const [ready, setReady] = useState(false);
-  const [name, setName] = useState("");
+export default function CaregiverPage() {
+  const [checked, setChecked] = useState(false);
+  const [hasSteps, setHasSteps] = useState(false);
+  const router = useRouter();
 
   useEffect(() => {
-    const protocol = ProtocolStore.loadProtocol();
-    if (!protocol) {
-      setReady(false);
-      return;
-    }
+    const steps = GuardianStepStore.loadSteps();
+    const ready = steps.length > 0;
+    setHasSteps(ready);
+    setChecked(true);
 
-    setName(`${protocol.name} v${protocol.version}`);
-    setReady(true);
-  }, []);
+    if (ready) {
+      router.replace("/caregiver/hands-free");
+    }
+  }, [router]);
+
+  if (!checked || hasSteps) {
+    return (
+      <main className="app-shell flex items-center justify-center">
+        <p className="text-sm font-medium text-slate-500">Loading...</p>
+      </main>
+    );
+  }
 
   return (
-    <main className="mx-auto min-h-screen max-w-3xl p-6">
-      <AppHeader />
-      <h1 className="mb-4 text-3xl font-bold">Caregiver Start</h1>
-      <section className="space-y-4 rounded-2xl bg-surface p-6 shadow-sm">
-        {ready ? (
-          <>
-            <p className="text-lg">Loaded protocol: <span className="font-semibold">{name}</span></p>
-            <Link className="inline-block rounded-2xl bg-primary px-8 py-5 text-2xl font-bold text-white" href="/caregiver/hands-free">Start Pod Change</Link>
-          </>
-        ) : (
-          <p className="text-lg text-alert">No protocol is loaded yet. Ask guardian to upload protocol and steps first.</p>
-        )}
+    <main className="app-shell flex items-center">
+      <section className="rivi-card w-full space-y-4 text-center shadow-soft">
+        <p className="text-sm font-semibold uppercase tracking-wide text-slate-500">No Steps Yet</p>
+        <h1 className="text-2xl font-bold text-slate-900">Caregiver flow is waiting for Guardian Setup.</h1>
+        <p className="text-sm text-slate-600">Ask a guardian to add care steps with notes and media first.</p>
+        <Link href="/guardian/setup" className="btn-primary w-full">
+          Open Guardian Setup
+        </Link>
       </section>
     </main>
   );

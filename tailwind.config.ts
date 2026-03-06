@@ -9,11 +9,14 @@ const config: Config = {
   theme: {
     extend: {
       colors: {
-        canvas: "#f4f7f5",
+        canvas: "#f2f8f5",
         surface: "#ffffff",
-        primary: "#0a6e4c",
-        primaryDark: "#055239",
-        alert: "#b00020"
+        primary: "#2f9d74",
+        primaryDark: "#227458",
+        alert: "#b94a63"
+      },
+      boxShadow: {
+        soft: "0 10px 30px -18px rgba(26, 77, 60, 0.35)"
       }
     }
   },

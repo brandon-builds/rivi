@@ -14,3 +14,14 @@ export type GuardianProtocol = {
   videoUrl: string;
   steps: Step[];
 };
+
+export type GuardianStepMediaType = "video" | "image" | "none";
+
+export type GuardianStep = {
+  id: string;
+  title: string;
+  notes: string;
+  mediaType: GuardianStepMediaType;
+  mediaUrl: string;
+  mediaName?: string;
+};

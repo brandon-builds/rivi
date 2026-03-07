@@ -6,46 +6,18 @@ import { GuardianStepStore } from "@/lib/stores/guardianStepStore";
 import { CaregiverSessionStore } from "@/lib/stores/caregiverSessionStore";
 import { GuardianStep } from "@/lib/types";
 
-type SpeechRecognitionResultLike = {
-  isFinal: boolean;
-  0: {
-    transcript: string;
-  };
-};
-
-type SpeechRecognitionEventLike = {
-  results: ArrayLike<SpeechRecognitionResultLike>;
-};
-
-type SpeechRecognitionLike = {
-  continuous: boolean;
-  interimResults: boolean;
-  lang: string;
-  onstart: (() => void) | null;
-  onend: (() => void) | null;
-  onerror: (() => void) | null;
-  onresult: ((event: SpeechRecognitionEventLike) => void) | null;
-  start: () => void;
-  stop: () => void;
-};
-
-type SpeechRecognitionConstructor = new () => SpeechRecognitionLike;
+type CaptureState = "idle" | "recording" | "transcribing" | "thinking";
 
 const TRANSITION_MS = 200;
-const WAKE_PHRASE = "hey rivi";
-const TURN_OFF_PHRASE = "turn off guidance";
+const MAX_RECORDING_MS = 9000;
 
-const getSpeechRecognition = (): SpeechRecognitionConstructor | null => {
-  if (typeof window === "undefined") {
-    return null;
+const pickRecorderMimeType = (): string | undefined => {
+  if (typeof window === "undefined" || typeof MediaRecorder === "undefined") {
+    return undefined;
   }
 
-  const w = window as Window & {
-    SpeechRecognition?: SpeechRecognitionConstructor;
-    webkitSpeechRecognition?: SpeechRecognitionConstructor;
-  };
-
-  return w.SpeechRecognition ?? w.webkitSpeechRecognition ?? null;
+  const preferred = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4", "audio/mpeg"];
+  return preferred.find((type) => MediaRecorder.isTypeSupported(type));
 };
 
 export default function HandsFreePage() {
@@ -58,20 +30,20 @@ export default function HandsFreePage() {
   const [guidanceOn, setGuidanceOn] = useState(false);
   const [permissionError, setPermissionError] = useState("");
   const [guidanceStream, setGuidanceStream] = useState<MediaStream | null>(null);
-  const [isListening, setIsListening] = useState(false);
-  const [speechSupported, setSpeechSupported] = useState(true);
-  const [wakeArmed, setWakeArmed] = useState(false);
+  const [recordingSupported, setRecordingSupported] = useState(true);
 
   const [latestTranscript, setLatestTranscript] = useState("");
   const [guidanceReply, setGuidanceReply] = useState("");
-  const [isThinking, setIsThinking] = useState(false);
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [replyVersion, setReplyVersion] = useState(0);
+  const [captureState, setCaptureState] = useState<CaptureState>("idle");
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
-  const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const recordedChunksRef = useRef<BlobPart[]>([]);
+  const recordingTracksRef = useRef<MediaStreamTrack[]>([]);
+  const recordingTimeoutRef = useRef<number | null>(null);
   const guidanceOnRef = useRef(false);
-  const lastProcessedRef = useRef("");
   const router = useRouter();
 
   useEffect(() => {
@@ -83,6 +55,8 @@ export default function HandsFreePage() {
     setSteps(savedSteps);
     setIndex(0);
     CaregiverSessionStore.begin(savedSteps.map((step) => step.id));
+
+    setRecordingSupported(typeof window !== "undefined" && typeof MediaRecorder !== "undefined");
   }, []);
 
   useEffect(() => {
@@ -124,10 +98,28 @@ export default function HandsFreePage() {
     window.speechSynthesis.speak(utterance);
   }, []);
 
+  const clearRecordingTimeout = () => {
+    if (recordingTimeoutRef.current !== null) {
+      window.clearTimeout(recordingTimeoutRef.current);
+      recordingTimeoutRef.current = null;
+    }
+  };
+
+  const stopActiveRecording = useCallback(() => {
+    clearRecordingTimeout();
+
+    const recorder = mediaRecorderRef.current;
+    if (recorder && recorder.state !== "inactive") {
+      recorder.stop();
+    }
+
+    mediaRecorderRef.current = null;
+    recordingTracksRef.current.forEach((track) => track.stop());
+    recordingTracksRef.current = [];
+  }, []);
+
   const stopGuidance = useCallback((announce: boolean) => {
-    recognitionRef.current?.stop();
-    recognitionRef.current = null;
-    setIsListening(false);
+    stopActiveRecording();
 
     setGuidanceStream((current) => {
       current?.getTracks().forEach((track) => track.stop());
@@ -137,12 +129,12 @@ export default function HandsFreePage() {
     stopSpeaking();
 
     setGuidanceOn(false);
-    setWakeArmed(false);
+    setCaptureState("idle");
 
     if (announce) {
       speakOut("Guidance is off.");
     }
-  }, [speakOut, stopSpeaking]);
+  }, [speakOut, stopActiveRecording, stopSpeaking]);
 
   useEffect(() => {
     return () => {
@@ -193,11 +185,13 @@ export default function HandsFreePage() {
 
     const question = spokenText.trim();
     if (!question) {
+      setPermissionError("I couldn’t hear that. Please try again.");
       return;
     }
 
     setLatestTranscript(question);
-    setIsThinking(true);
+    setPermissionError("");
+    setCaptureState("thinking");
     setGuidanceReply("Thinking...");
     setReplyVersion((curr) => curr + 1);
 
@@ -233,45 +227,143 @@ export default function HandsFreePage() {
       setReplyVersion((curr) => curr + 1);
       speakOut(fallbackReply);
     } finally {
-      setIsThinking(false);
+      if (guidanceOnRef.current) {
+        setCaptureState("idle");
+      }
     }
   }, [currentStep, index, speakOut, steps.length]);
 
-  const processFinalTranscript = useCallback((rawTranscript: string) => {
-    const transcript = rawTranscript.trim();
-    if (!transcript) {
+  const handleTranscribeAndRespond = useCallback(async (audioBlob: Blob) => {
+    if (!audioBlob.size) {
+      setPermissionError("I couldn’t hear that. Please try again.");
+      setCaptureState("idle");
       return;
     }
 
-    const normalized = transcript.toLowerCase();
-    if (lastProcessedRef.current === normalized) {
-      return;
-    }
+    setCaptureState("transcribing");
 
-    lastProcessedRef.current = normalized;
+    try {
+      const extension = audioBlob.type.includes("mp4") ? "m4a" : "webm";
+      const file = new File([audioBlob], `rivi-guidance.${extension}`, {
+        type: audioBlob.type || "audio/webm"
+      });
 
-    if (normalized.includes(TURN_OFF_PHRASE)) {
-      stopGuidance(true);
-      return;
-    }
+      const formData = new FormData();
+      formData.append("audio", file);
 
-    if (normalized.includes(WAKE_PHRASE)) {
-      const stripped = transcript.replace(/hey\s+rivi/gi, "").replace(/^[-,:\s]+/, "").trim();
-      setWakeArmed(true);
+      const response = await fetch("/api/rivi-transcribe", {
+        method: "POST",
+        body: formData
+      });
 
-      if (stripped) {
-        setWakeArmed(false);
-        void requestGuidance(stripped);
+      if (!response.ok) {
+        throw new Error("Transcription failed");
       }
 
+      const payload = (await response.json()) as { transcript?: string };
+      const transcript = payload.transcript?.trim();
+
+      if (!transcript) {
+        setPermissionError("I couldn’t hear that. Please try again.");
+        setCaptureState("idle");
+        return;
+      }
+
+      await requestGuidance(transcript);
+    } catch {
+      setPermissionError("I couldn’t hear that. Please try again.");
+      setCaptureState("idle");
+    }
+  }, [requestGuidance]);
+
+  const stopRecordingSession = useCallback(() => {
+    if (captureState !== "recording") {
       return;
     }
 
-    if (wakeArmed) {
-      setWakeArmed(false);
-      void requestGuidance(transcript);
+    stopActiveRecording();
+  }, [captureState, stopActiveRecording]);
+
+  const startRecordingSession = () => {
+    if (!guidanceOn || captureState !== "idle") {
+      return;
     }
-  }, [requestGuidance, stopGuidance, wakeArmed]);
+
+    if (typeof MediaRecorder === "undefined") {
+      setRecordingSupported(false);
+      setPermissionError("Voice capture is not supported in this browser.");
+      return;
+    }
+
+    if (!guidanceStream) {
+      setPermissionError("Camera and microphone access are required for AI Guidance.");
+      return;
+    }
+
+    const audioTracks = guidanceStream.getAudioTracks();
+    if (audioTracks.length === 0) {
+      setPermissionError("Camera and microphone access are required for AI Guidance.");
+      return;
+    }
+
+    setPermissionError("");
+    recordedChunksRef.current = [];
+    const tracks = audioTracks.map((track) => track.clone());
+    recordingTracksRef.current = tracks;
+
+    const recordingStream = new MediaStream(tracks);
+    const mimeType = pickRecorderMimeType();
+
+    const recorder = mimeType
+      ? new MediaRecorder(recordingStream, { mimeType })
+      : new MediaRecorder(recordingStream);
+
+    recorder.ondataavailable = (event) => {
+      if (event.data && event.data.size > 0) {
+        recordedChunksRef.current.push(event.data);
+      }
+    };
+
+    recorder.onstop = () => {
+      clearRecordingTimeout();
+      setCaptureState("idle");
+      const blobType = mimeType ?? recorder.mimeType ?? "audio/webm";
+      const audioBlob = new Blob(recordedChunksRef.current, { type: blobType });
+      recordedChunksRef.current = [];
+      recordingTracksRef.current.forEach((track) => track.stop());
+      recordingTracksRef.current = [];
+      mediaRecorderRef.current = null;
+      void handleTranscribeAndRespond(audioBlob);
+    };
+
+    recorder.onerror = () => {
+      clearRecordingTimeout();
+      setCaptureState("idle");
+      setPermissionError("I couldn’t hear that. Please try again.");
+      recordingTracksRef.current.forEach((track) => track.stop());
+      recordingTracksRef.current = [];
+      mediaRecorderRef.current = null;
+    };
+
+    mediaRecorderRef.current = recorder;
+    recorder.start();
+    setCaptureState("recording");
+
+    recordingTimeoutRef.current = window.setTimeout(() => {
+      if (mediaRecorderRef.current && mediaRecorderRef.current.state === "recording") {
+        mediaRecorderRef.current.stop();
+      }
+    }, MAX_RECORDING_MS);
+  };
+
+  const handleAskRiviTap = () => {
+    if (captureState === "recording") {
+      stopRecordingSession();
+      return;
+    }
+
+    startRecordingSession();
+  };
 
   const enableGuidance = async () => {
     setPermissionError("");
@@ -285,51 +377,6 @@ export default function HandsFreePage() {
       const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
       setGuidanceStream(stream);
       setGuidanceOn(true);
-
-      const Recognition = getSpeechRecognition();
-      if (Recognition) {
-        const recognition = new Recognition();
-        recognition.continuous = true;
-        recognition.interimResults = true;
-        recognition.lang = "en-US";
-        recognition.onstart = () => setIsListening(true);
-        recognition.onend = () => {
-          setIsListening(false);
-
-          if (guidanceOnRef.current && recognitionRef.current) {
-            try {
-              recognitionRef.current.start();
-            } catch {
-              // Browser can throw if restart happens too quickly; ignore and wait for next user action.
-            }
-          }
-        };
-        recognition.onerror = () => setIsListening(false);
-        recognition.onresult = (event) => {
-          const finals: string[] = [];
-
-          for (let i = 0; i < event.results.length; i += 1) {
-            const result = event.results[i];
-            if (result.isFinal) {
-              finals.push(result[0]?.transcript ?? "");
-            }
-          }
-
-          if (finals.length === 0) {
-            return;
-          }
-
-          const finalTranscript = finals.join(" ").trim();
-          processFinalTranscript(finalTranscript);
-        };
-
-        recognitionRef.current = recognition;
-        recognition.start();
-        setSpeechSupported(true);
-      } else {
-        setSpeechSupported(false);
-      }
-
       speakOut("I'm on. Ask me anything.");
     } catch {
       setPermissionError("Camera and microphone access are required for AI Guidance.");
@@ -361,7 +408,7 @@ export default function HandsFreePage() {
   }
 
   const animatedClass = `step-swap ${isTransitioning ? "step-swap-out" : ""}`;
-  const showGuidanceCard = guidanceOn && Boolean(latestTranscript || guidanceReply || isThinking);
+  const showGuidanceCard = Boolean(latestTranscript || guidanceReply || captureState === "thinking" || captureState === "transcribing");
 
   return (
     <>
@@ -404,7 +451,9 @@ export default function HandsFreePage() {
             <section className="rivi-card guidance-reply-card" key={replyVersion}>
               <p className="text-sm font-semibold text-primary">Rivi Guidance</p>
               {latestTranscript ? <p className="mt-1 text-xs text-slate-500">You said: {latestTranscript}</p> : null}
-              <p className="mt-3 whitespace-pre-line text-sm leading-relaxed text-slate-800">{isThinking ? "Thinking..." : guidanceReply}</p>
+              <p className="mt-3 whitespace-pre-line text-sm leading-relaxed text-slate-800">
+                {captureState === "transcribing" ? "Transcribing..." : captureState === "thinking" ? "Thinking..." : guidanceReply}
+              </p>
               {isSpeaking ? (
                 <button type="button" className="btn-secondary mt-3 w-full active:scale-[0.98] transition-transform duration-150" onClick={stopSpeaking}>
                   Stop Speaking
@@ -416,17 +465,38 @@ export default function HandsFreePage() {
       </main>
 
       {guidanceOn ? (
-        <aside className="guidance-panel">
-          <div className="guidance-preview-wrap">
-            <video ref={videoRef} className="guidance-preview" autoPlay playsInline muted />
+        <>
+          <aside className="guidance-panel">
+            <div className="guidance-preview-wrap">
+              <video ref={videoRef} className="guidance-preview" autoPlay playsInline muted />
+            </div>
+            <div className="mt-2 flex items-center gap-2">
+              <span className={`guidance-mic-dot ${captureState === "recording" ? "guidance-mic-dot-live" : ""}`} />
+              <p className="text-xs font-medium text-slate-700">
+                {captureState === "recording" ? "Recording..." : captureState === "transcribing" ? "Transcribing..." : captureState === "thinking" ? "Thinking..." : "Guidance On"}
+              </p>
+            </div>
+            <p className="mt-1 text-[11px] text-slate-500">Guidance is on. Tap Ask Rivi whenever you need help.</p>
+            {!recordingSupported ? <p className="mt-1 text-[11px] text-slate-500">Voice capture is not supported in this browser.</p> : null}
+          </aside>
+
+          <div className="guidance-fab-wrap">
+            <button
+              type="button"
+              className={`guidance-fab ${captureState === "recording" ? "guidance-fab-listening" : ""}`}
+              onClick={handleAskRiviTap}
+              disabled={captureState === "transcribing" || captureState === "thinking" || !recordingSupported}
+              aria-label="Ask Rivi"
+            >
+              <svg viewBox="0 0 24 24" className="h-7 w-7" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+                <path d="M12 15a3 3 0 0 0 3-3V8a3 3 0 1 0-6 0v4a3 3 0 0 0 3 3Z" fill="currentColor" />
+                <path d="M18 11.5a6 6 0 0 1-12 0" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" />
+                <path d="M12 17.5V21" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" />
+              </svg>
+            </button>
+            <p className="guidance-fab-label">Ask Rivi</p>
           </div>
-          <div className="mt-2 flex items-center gap-2">
-            <span className={`guidance-mic-dot ${isListening ? "guidance-mic-dot-live" : ""}`} />
-            <p className="text-xs font-medium text-slate-700">Listening...</p>
-          </div>
-          <p className="mt-1 text-[11px] text-slate-500">Say &quot;Hey Rivi&quot; to ask a question.</p>
-          {!speechSupported ? <p className="mt-1 text-[11px] text-slate-500">Voice transcription not supported in this browser.</p> : null}
-        </aside>
+        </>
       ) : null}
 
       <div className="sticky-cta-bar">

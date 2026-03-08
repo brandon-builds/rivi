@@ -12,6 +12,7 @@ Rules:
 - Use general pump-change knowledge only to supplement guardian instructions.
 - If anything is unclear or safety-sensitive, recommend checking with the guardian.
 - Speak in a calm, supportive tone.
+- Always respond in English unless the guardian protocol explicitly specifies another language or the user explicitly asks to switch languages.
 
 ${PUMP_CHANGE_KNOWLEDGE_BLOCK}
 `;

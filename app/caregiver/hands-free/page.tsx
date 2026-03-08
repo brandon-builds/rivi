@@ -4,21 +4,25 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { GuardianStepStore } from "@/lib/stores/guardianStepStore";
 import { CaregiverSessionStore } from "@/lib/stores/caregiverSessionStore";
+import { buildRiviRealtimeInstructions } from "@/lib/services/riviGuidanceContext";
 import { GuardianStep } from "@/lib/types";
 
-type CaptureState = "idle" | "recording" | "transcribing" | "thinking";
+type VoiceState = "idle" | "connecting" | "listening" | "speaking";
+
+type RealtimeSessionResponse = {
+  client_secret?: {
+    value?: string;
+  };
+};
+
+type RealtimeEvent = {
+  type?: string;
+  transcript?: string;
+  delta?: string;
+};
 
 const TRANSITION_MS = 200;
-const MAX_RECORDING_MS = 9000;
-
-const pickRecorderMimeType = (): string | undefined => {
-  if (typeof window === "undefined" || typeof MediaRecorder === "undefined") {
-    return undefined;
-  }
-
-  const preferred = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4", "audio/mpeg"];
-  return preferred.find((type) => MediaRecorder.isTypeSupported(type));
-};
+const REALTIME_MODEL = "gpt-4o-realtime-preview";
 
 export default function HandsFreePage() {
   const [steps, setSteps] = useState<GuardianStep[]>([]);
@@ -30,20 +34,25 @@ export default function HandsFreePage() {
   const [guidanceOn, setGuidanceOn] = useState(false);
   const [permissionError, setPermissionError] = useState("");
   const [guidanceStream, setGuidanceStream] = useState<MediaStream | null>(null);
-  const [recordingSupported, setRecordingSupported] = useState(true);
+
+  const [voiceState, setVoiceState] = useState<VoiceState>("idle");
+  const [realtimeSupported, setRealtimeSupported] = useState(true);
+  const [sessionActive, setSessionActive] = useState(false);
 
   const [latestTranscript, setLatestTranscript] = useState("");
   const [guidanceReply, setGuidanceReply] = useState("");
-  const [isSpeaking, setIsSpeaking] = useState(false);
   const [replyVersion, setReplyVersion] = useState(0);
-  const [captureState, setCaptureState] = useState<CaptureState>("idle");
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const recordedChunksRef = useRef<BlobPart[]>([]);
-  const recordingTracksRef = useRef<MediaStreamTrack[]>([]);
-  const recordingTimeoutRef = useRef<number | null>(null);
+  const remoteAudioRef = useRef<HTMLAudioElement | null>(null);
+  const peerRef = useRef<RTCPeerConnection | null>(null);
+  const dataChannelRef = useRef<RTCDataChannel | null>(null);
+  const audioTrackRef = useRef<MediaStreamTrack | null>(null);
   const guidanceOnRef = useRef(false);
+  const sessionActiveRef = useRef(false);
+  const voiceStateRef = useRef<VoiceState>("idle");
+  const assistantTranscriptBufferRef = useRef("");
+  const stepIntroPendingRef = useRef(false);
   const router = useRouter();
 
   useEffect(() => {
@@ -51,12 +60,84 @@ export default function HandsFreePage() {
   }, [guidanceOn]);
 
   useEffect(() => {
+    sessionActiveRef.current = sessionActive;
+  }, [sessionActive]);
+
+  useEffect(() => {
+    voiceStateRef.current = voiceState;
+  }, [voiceState]);
+
+  const currentStep = useMemo(() => steps[index], [steps, index]);
+  const isLastStep = index >= steps.length - 1;
+
+  const sendRealtimeEvent = useCallback((event: Record<string, unknown>) => {
+    const channel = dataChannelRef.current;
+    if (!channel || channel.readyState !== "open") {
+      return;
+    }
+
+    channel.send(JSON.stringify(event));
+  }, []);
+
+  const stopRealtimeSession = useCallback(() => {
+    dataChannelRef.current?.close();
+    dataChannelRef.current = null;
+
+    peerRef.current?.getSenders().forEach((sender) => {
+      sender.track?.stop();
+    });
+    peerRef.current?.close();
+    peerRef.current = null;
+
+    audioTrackRef.current?.stop();
+    audioTrackRef.current = null;
+
+    if (remoteAudioRef.current) {
+      remoteAudioRef.current.pause();
+      remoteAudioRef.current.srcObject = null;
+    }
+
+    setSessionActive(false);
+    setVoiceState("idle");
+  }, []);
+
+  useEffect(() => {
     const savedSteps = GuardianStepStore.loadSteps();
     setSteps(savedSteps);
     setIndex(0);
     CaregiverSessionStore.begin(savedSteps.map((step) => step.id));
 
-    setRecordingSupported(typeof window !== "undefined" && typeof MediaRecorder !== "undefined");
+    const supported = typeof window !== "undefined" && typeof window.RTCPeerConnection !== "undefined";
+    setRealtimeSupported(supported);
+  }, []);
+
+  useEffect(() => {
+    const audio = remoteAudioRef.current;
+    if (!audio) {
+      return;
+    }
+
+    audio.autoplay = true;
+    audio.setAttribute("playsinline", "true");
+    audio.muted = false;
+    audio.volume = 1;
+
+    const handlePlay = () => setVoiceState("speaking");
+    const handlePause = () => {
+      setVoiceState((current) => (sessionActiveRef.current ? (audioTrackRef.current?.enabled ? "listening" : "idle") : current));
+    };
+
+    audio.addEventListener("play", handlePlay);
+    audio.addEventListener("pause", handlePause);
+    audio.addEventListener("ended", handlePause);
+
+    return () => {
+      audio.removeEventListener("play", handlePlay);
+      audio.removeEventListener("pause", handlePause);
+      audio.removeEventListener("ended", handlePause);
+      audio.pause();
+      audio.srcObject = null;
+    };
   }, []);
 
   useEffect(() => {
@@ -73,77 +154,63 @@ export default function HandsFreePage() {
     };
   }, [guidanceStream]);
 
-  const stopSpeaking = useCallback(() => {
-    if (typeof window === "undefined" || !window.speechSynthesis) {
+  const sendStepContext = useCallback((allSteps: GuardianStep[], currentStepId?: string) => {
+    const channel = dataChannelRef.current;
+    if (!channel || channel.readyState !== "open") {
       return;
     }
 
-    window.speechSynthesis.cancel();
-    setIsSpeaking(false);
+    const instructions = buildRiviRealtimeInstructions(allSteps, currentStepId);
+
+    channel.send(JSON.stringify({
+      type: "session.update",
+      session: {
+        instructions
+      }
+    }));
   }, []);
 
-  const speakOut = useCallback((text: string) => {
-    if (typeof window === "undefined" || !window.speechSynthesis) {
+  const promptStepGuidance = useCallback((mode: "intro" | "advance") => {
+    const channel = dataChannelRef.current;
+    if (!channel || channel.readyState !== "open" || !currentStep) {
       return;
     }
 
-    window.speechSynthesis.cancel();
+    const prefix = mode === "advance" ? "Start with: Great. Let's move to the next step." : "Start with a calm transition phrase.";
 
-    const utterance = new SpeechSynthesisUtterance(text);
-    utterance.rate = 1;
-    utterance.pitch = 1;
-    utterance.onstart = () => setIsSpeaking(true);
-    utterance.onend = () => setIsSpeaking(false);
-    utterance.onerror = () => setIsSpeaking(false);
-    window.speechSynthesis.speak(utterance);
-  }, []);
-
-  const clearRecordingTimeout = () => {
-    if (recordingTimeoutRef.current !== null) {
-      window.clearTimeout(recordingTimeoutRef.current);
-      recordingTimeoutRef.current = null;
-    }
-  };
-
-  const stopActiveRecording = useCallback(() => {
-    clearRecordingTimeout();
-
-    const recorder = mediaRecorderRef.current;
-    if (recorder && recorder.state !== "inactive") {
-      recorder.stop();
-    }
-
-    mediaRecorderRef.current = null;
-    recordingTracksRef.current.forEach((track) => track.stop());
-    recordingTracksRef.current = [];
-  }, []);
-
-  const stopGuidance = useCallback((announce: boolean) => {
-    stopActiveRecording();
-
-    setGuidanceStream((current) => {
-      current?.getTracks().forEach((track) => track.stop());
-      return null;
+    sendRealtimeEvent({
+      type: "response.create",
+      response: {
+        modalities: ["audio", "text"],
+        instructions: `${prefix} Then briefly guide the caregiver for step ${index + 1} of ${steps.length}: \"${currentStep.title}\" using guardian notes first. Keep it to 1-2 short sentences.`
+      }
     });
+  }, [currentStep, index, sendRealtimeEvent, steps.length]);
 
-    stopSpeaking();
-
-    setGuidanceOn(false);
-    setCaptureState("idle");
-
-    if (announce) {
-      speakOut("Guidance is off.");
+  useEffect(() => {
+    if (!sessionActive || !currentStep) {
+      return;
     }
-  }, [speakOut, stopActiveRecording, stopSpeaking]);
+
+    sendStepContext(steps, currentStep.id);
+
+    // When the step changes during an active session, proactively guide the caregiver.
+    if (stepIntroPendingRef.current) {
+      promptStepGuidance("advance");
+      stepIntroPendingRef.current = false;
+    }
+  }, [currentStep, promptStepGuidance, sendStepContext, sessionActive, steps]);
 
   useEffect(() => {
     return () => {
-      stopGuidance(false);
-    };
-  }, [stopGuidance]);
+      stopRealtimeSession();
 
-  const currentStep = useMemo(() => steps[index], [steps, index]);
-  const isLastStep = index >= steps.length - 1;
+      setGuidanceStream((current) => {
+        current?.getTracks().forEach((track) => track.stop());
+        return null;
+      });
+    };
+  }, [stopRealtimeSession]);
 
   const advanceAfterTransition = () => {
     if (!currentStep) {
@@ -175,194 +242,208 @@ export default function HandsFreePage() {
 
     setShowCompleteConfirm(false);
     setIsAdvancing(true);
+    stepIntroPendingRef.current = true;
     advanceAfterTransition();
   };
 
-  const requestGuidance = useCallback(async (spokenText: string) => {
-    if (!currentStep) {
+  const connectRealtimeSession = async () => {
+    if (!guidanceStream || !currentStep || !realtimeSupported) {
+      if (!realtimeSupported) {
+        setPermissionError("Realtime voice is not supported in this browser.");
+      }
       return;
     }
 
-    const question = spokenText.trim();
-    if (!question) {
-      setPermissionError("I couldn’t hear that. Please try again.");
-      return;
-    }
-
-    setLatestTranscript(question);
     setPermissionError("");
-    setCaptureState("thinking");
-    setGuidanceReply("Thinking...");
-    setReplyVersion((curr) => curr + 1);
+    setVoiceState("connecting");
 
     try {
-      const response = await fetch("/api/rivi-chat", {
+      const sessionResponse = await fetch("/api/realtime/session", { method: "POST" });
+      if (!sessionResponse.ok) {
+        throw new Error("Failed to create realtime session.");
+      }
+
+      const sessionData = (await sessionResponse.json()) as RealtimeSessionResponse;
+      const ephemeralKey = sessionData.client_secret?.value;
+
+      if (!ephemeralKey) {
+        throw new Error("Missing client secret.");
+      }
+
+      console.debug("[Rivi Realtime] Session token acquired");
+
+      const peer = new RTCPeerConnection();
+      peerRef.current = peer;
+      peer.addTransceiver("audio", { direction: "recvonly" });
+
+      peer.ontrack = (event) => {
+        const stream = event.streams[0] ?? new MediaStream([event.track]);
+        const audioEl = remoteAudioRef.current;
+
+        console.debug("[Rivi Realtime] Remote track received", {
+          kind: event.track?.kind,
+          id: event.track?.id,
+          streamId: stream.id
+        });
+
+        if (!audioEl) {
+          return;
+        }
+
+        audioEl.srcObject = stream;
+        console.debug("[Rivi Realtime] Audio srcObject assigned");
+        void audioEl.play()
+          .then(() => {
+            console.debug("[Rivi Realtime] audio.play() success");
+          })
+          .catch((error) => {
+            console.error("[Rivi Realtime] audio.play() failed", error);
+          });
+      };
+
+      const channel = peer.createDataChannel("oai-events");
+      dataChannelRef.current = channel;
+
+      channel.onopen = () => {
+        console.debug("[Rivi Realtime] Data channel connected");
+        setSessionActive(true);
+        setVoiceState("listening");
+        sendStepContext(steps, currentStep.id);
+        promptStepGuidance("intro");
+      };
+
+      channel.onmessage = (event) => {
+        try {
+          const payload = JSON.parse(String(event.data)) as RealtimeEvent;
+
+          if (payload.type === "conversation.item.input_audio_transcription.completed" && payload.transcript) {
+            if (voiceStateRef.current === "speaking" || !remoteAudioRef.current?.paused) {
+              sendRealtimeEvent({ type: "response.cancel" });
+              if (remoteAudioRef.current) {
+                remoteAudioRef.current.pause();
+              }
+              setVoiceState("listening");
+            }
+
+            const normalized = payload.transcript.trim().toLowerCase();
+            const compact = normalized.replace(/[.!?]/g, "").trim();
+            const isConfirmation = /\b(done|okay|ok|got it|finished)\b/.test(compact);
+
+            if (isConfirmation) {
+              setLatestTranscript(payload.transcript);
+              setGuidanceReply("Great. Let's move to the next step.");
+              setReplyVersion((current) => current + 1);
+
+              if (!isAdvancing && !isTransitioning) {
+                setIsAdvancing(true);
+                stepIntroPendingRef.current = true;
+                advanceAfterTransition();
+              }
+              return;
+            }
+
+            setLatestTranscript(payload.transcript);
+            setGuidanceReply("Thinking...");
+            setReplyVersion((current) => current + 1);
+            assistantTranscriptBufferRef.current = "";
+            return;
+          }
+
+          if ((payload.type === "response.audio_transcript.delta" || payload.type === "response.text.delta") && payload.delta) {
+            assistantTranscriptBufferRef.current += payload.delta;
+            setGuidanceReply(assistantTranscriptBufferRef.current);
+            return;
+          }
+
+          if ((payload.type === "response.audio_transcript.done" || payload.type === "response.text.done") && payload.transcript) {
+            setGuidanceReply(payload.transcript);
+            setReplyVersion((current) => current + 1);
+            return;
+          }
+
+          if (payload.type === "error") {
+            setPermissionError("Voice guidance hit a connection issue. Please try again.");
+          }
+        } catch {
+          // Ignore malformed realtime events.
+        }
+      };
+
+      const audioTrack = guidanceStream.getAudioTracks()[0];
+      if (!audioTrack) {
+        throw new Error("Missing microphone track.");
+      }
+
+      const localTrack = audioTrack.clone();
+      localTrack.enabled = true;
+      audioTrackRef.current = localTrack;
+      peer.addTrack(localTrack, new MediaStream([localTrack]));
+      console.debug("[Rivi Realtime] Local mic track attached", {
+        id: localTrack.id,
+        kind: localTrack.kind,
+        enabled: localTrack.enabled
+      });
+
+      const offer = await peer.createOffer();
+      await peer.setLocalDescription(offer);
+
+      const sdpResponse = await fetch(`https://api.openai.com/v1/realtime?model=${REALTIME_MODEL}`, {
         method: "POST",
         headers: {
-          "Content-Type": "application/json"
+          Authorization: `Bearer ${ephemeralKey}`,
+          "Content-Type": "application/sdp"
         },
-        body: JSON.stringify({
-          message: question,
-          stepContext: {
-            stepTitle: currentStep.title,
-            guardianNotes: currentStep.notes,
-            stepNumber: index + 1,
-            totalSteps: steps.length
-          }
-        })
+        body: offer.sdp
       });
 
-      if (!response.ok) {
-        throw new Error("Chat request failed");
+      if (!sdpResponse.ok) {
+        throw new Error("Failed realtime SDP exchange.");
       }
 
-      const payload = (await response.json()) as { response?: string };
-      const nextReply = payload.response?.trim() || "Take your time. Stay with this step and follow the guardian notes carefully.";
-      setGuidanceReply(nextReply);
-      setReplyVersion((curr) => curr + 1);
-      speakOut(nextReply);
+      const answerSdp = await sdpResponse.text();
+      await peer.setRemoteDescription({
+        type: "answer",
+        sdp: answerSdp
+      });
+      console.debug("[Rivi Realtime] Session connected");
     } catch {
-      const fallbackReply = "I could not connect right now. Keep going step by step, and seek urgent professional help if there are immediate safety concerns.";
-      setGuidanceReply(fallbackReply);
-      setReplyVersion((curr) => curr + 1);
-      speakOut(fallbackReply);
-    } finally {
-      if (guidanceOnRef.current) {
-        setCaptureState("idle");
-      }
+      stopRealtimeSession();
+      setPermissionError("Unable to start AI voice guidance right now.");
     }
-  }, [currentStep, index, speakOut, steps.length]);
-
-  const handleTranscribeAndRespond = useCallback(async (audioBlob: Blob) => {
-    if (!audioBlob.size) {
-      setPermissionError("I couldn’t hear that. Please try again.");
-      setCaptureState("idle");
-      return;
-    }
-
-    setCaptureState("transcribing");
-
-    try {
-      const extension = audioBlob.type.includes("mp4") ? "m4a" : "webm";
-      const file = new File([audioBlob], `rivi-guidance.${extension}`, {
-        type: audioBlob.type || "audio/webm"
-      });
-
-      const formData = new FormData();
-      formData.append("audio", file);
-
-      const response = await fetch("/api/rivi-transcribe", {
-        method: "POST",
-        body: formData
-      });
-
-      if (!response.ok) {
-        throw new Error("Transcription failed");
-      }
-
-      const payload = (await response.json()) as { transcript?: string };
-      const transcript = payload.transcript?.trim();
-
-      if (!transcript) {
-        setPermissionError("I couldn’t hear that. Please try again.");
-        setCaptureState("idle");
-        return;
-      }
-
-      await requestGuidance(transcript);
-    } catch {
-      setPermissionError("I couldn’t hear that. Please try again.");
-      setCaptureState("idle");
-    }
-  }, [requestGuidance]);
-
-  const stopRecordingSession = useCallback(() => {
-    if (captureState !== "recording") {
-      return;
-    }
-
-    stopActiveRecording();
-  }, [captureState, stopActiveRecording]);
-
-  const startRecordingSession = () => {
-    if (!guidanceOn || captureState !== "idle") {
-      return;
-    }
-
-    if (typeof MediaRecorder === "undefined") {
-      setRecordingSupported(false);
-      setPermissionError("Voice capture is not supported in this browser.");
-      return;
-    }
-
-    if (!guidanceStream) {
-      setPermissionError("Camera and microphone access are required for AI Guidance.");
-      return;
-    }
-
-    const audioTracks = guidanceStream.getAudioTracks();
-    if (audioTracks.length === 0) {
-      setPermissionError("Camera and microphone access are required for AI Guidance.");
-      return;
-    }
-
-    setPermissionError("");
-    recordedChunksRef.current = [];
-    const tracks = audioTracks.map((track) => track.clone());
-    recordingTracksRef.current = tracks;
-
-    const recordingStream = new MediaStream(tracks);
-    const mimeType = pickRecorderMimeType();
-
-    const recorder = mimeType
-      ? new MediaRecorder(recordingStream, { mimeType })
-      : new MediaRecorder(recordingStream);
-
-    recorder.ondataavailable = (event) => {
-      if (event.data && event.data.size > 0) {
-        recordedChunksRef.current.push(event.data);
-      }
-    };
-
-    recorder.onstop = () => {
-      clearRecordingTimeout();
-      setCaptureState("idle");
-      const blobType = mimeType ?? recorder.mimeType ?? "audio/webm";
-      const audioBlob = new Blob(recordedChunksRef.current, { type: blobType });
-      recordedChunksRef.current = [];
-      recordingTracksRef.current.forEach((track) => track.stop());
-      recordingTracksRef.current = [];
-      mediaRecorderRef.current = null;
-      void handleTranscribeAndRespond(audioBlob);
-    };
-
-    recorder.onerror = () => {
-      clearRecordingTimeout();
-      setCaptureState("idle");
-      setPermissionError("I couldn’t hear that. Please try again.");
-      recordingTracksRef.current.forEach((track) => track.stop());
-      recordingTracksRef.current = [];
-      mediaRecorderRef.current = null;
-    };
-
-    mediaRecorderRef.current = recorder;
-    recorder.start();
-    setCaptureState("recording");
-
-    recordingTimeoutRef.current = window.setTimeout(() => {
-      if (mediaRecorderRef.current && mediaRecorderRef.current.state === "recording") {
-        mediaRecorderRef.current.stop();
-      }
-    }, MAX_RECORDING_MS);
   };
 
-  const handleAskRiviTap = () => {
-    if (captureState === "recording") {
-      stopRecordingSession();
+  const toggleListening = () => {
+    if (!sessionActive || !audioTrackRef.current) {
       return;
     }
 
-    startRecordingSession();
+    const nextEnabled = !audioTrackRef.current.enabled;
+    audioTrackRef.current.enabled = nextEnabled;
+    setVoiceState(nextEnabled ? "listening" : "idle");
+  };
+
+  const handleAskRiviTap = async () => {
+    if (!guidanceOn || voiceState === "connecting") {
+      return;
+    }
+
+    if (!sessionActive) {
+      const audioEl = remoteAudioRef.current;
+      if (audioEl) {
+        void audioEl.play()
+          .then(() => {
+            console.debug("[Rivi Realtime] audio.play() preflight success");
+          })
+          .catch((error) => {
+            console.error("[Rivi Realtime] audio.play() preflight failed", error);
+          });
+      }
+
+      await connectRealtimeSession();
+      return;
+    }
+
+    toggleListening();
   };
 
   const enableGuidance = async () => {
@@ -377,16 +458,24 @@ export default function HandsFreePage() {
       const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
       setGuidanceStream(stream);
       setGuidanceOn(true);
-      speakOut("I'm on. Ask me anything.");
+      setVoiceState("idle");
     } catch {
       setPermissionError("Camera and microphone access are required for AI Guidance.");
-      stopGuidance(false);
+      setGuidanceOn(false);
     }
   };
 
   const handleGuidanceToggle = async () => {
     if (guidanceOn) {
-      stopGuidance(true);
+      stopRealtimeSession();
+
+      setGuidanceStream((current) => {
+        current?.getTracks().forEach((track) => track.stop());
+        return null;
+      });
+
+      setGuidanceOn(false);
+      setVoiceState("idle");
       return;
     }
 
@@ -408,10 +497,11 @@ export default function HandsFreePage() {
   }
 
   const animatedClass = `step-swap ${isTransitioning ? "step-swap-out" : ""}`;
-  const showGuidanceCard = Boolean(latestTranscript || guidanceReply || captureState === "thinking" || captureState === "transcribing");
+  const showGuidanceCard = Boolean(latestTranscript || guidanceReply);
 
   return (
     <>
+      <audio ref={remoteAudioRef} autoPlay playsInline hidden />
       <main className="app-shell pb-40">
         <header className="mb-5 flex items-center justify-between">
           <button type="button" className="btn-secondary px-4 active:scale-[0.98] transition-transform duration-150" onClick={() => router.push("/")}>
@@ -451,14 +541,7 @@ export default function HandsFreePage() {
             <section className="rivi-card guidance-reply-card" key={replyVersion}>
               <p className="text-sm font-semibold text-primary">Rivi Guidance</p>
               {latestTranscript ? <p className="mt-1 text-xs text-slate-500">You said: {latestTranscript}</p> : null}
-              <p className="mt-3 whitespace-pre-line text-sm leading-relaxed text-slate-800">
-                {captureState === "transcribing" ? "Transcribing..." : captureState === "thinking" ? "Thinking..." : guidanceReply}
-              </p>
-              {isSpeaking ? (
-                <button type="button" className="btn-secondary mt-3 w-full active:scale-[0.98] transition-transform duration-150" onClick={stopSpeaking}>
-                  Stop Speaking
-                </button>
-              ) : null}
+              {guidanceReply ? <p className="mt-3 whitespace-pre-line text-sm leading-relaxed text-slate-800">{guidanceReply}</p> : null}
             </section>
           ) : null}
         </section>
@@ -471,21 +554,21 @@ export default function HandsFreePage() {
               <video ref={videoRef} className="guidance-preview" autoPlay playsInline muted />
             </div>
             <div className="mt-2 flex items-center gap-2">
-              <span className={`guidance-mic-dot ${captureState === "recording" ? "guidance-mic-dot-live" : ""}`} />
-              <p className="text-xs font-medium text-slate-700">
-                {captureState === "recording" ? "Recording..." : captureState === "transcribing" ? "Transcribing..." : captureState === "thinking" ? "Thinking..." : "Guidance On"}
-              </p>
+              <span className={`guidance-mic-dot ${voiceState === "listening" ? "guidance-mic-dot-live" : ""}`} />
+              <p className="text-xs font-medium text-slate-700">{voiceState === "connecting" ? "Connecting..." : voiceState === "listening" ? "Listening..." : voiceState === "speaking" ? "Speaking..." : "Ready"}</p>
             </div>
             <p className="mt-1 text-[11px] text-slate-500">Guidance is on. Tap Ask Rivi whenever you need help.</p>
-            {!recordingSupported ? <p className="mt-1 text-[11px] text-slate-500">Voice capture is not supported in this browser.</p> : null}
+            {!realtimeSupported ? <p className="mt-1 text-[11px] text-slate-500">Realtime voice is not supported in this browser.</p> : null}
           </aside>
 
           <div className="guidance-fab-wrap">
             <button
               type="button"
-              className={`guidance-fab ${captureState === "recording" ? "guidance-fab-listening" : ""}`}
-              onClick={handleAskRiviTap}
-              disabled={captureState === "transcribing" || captureState === "thinking" || !recordingSupported}
+              className={`guidance-fab ${voiceState === "listening" ? "guidance-fab-listening" : ""}`}
+              onClick={() => {
+                void handleAskRiviTap();
+              }}
+              disabled={voiceState === "connecting" || !realtimeSupported}
               aria-label="Ask Rivi"
             >
               <svg viewBox="0 0 24 24" className="h-7 w-7" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
@@ -512,7 +595,9 @@ export default function HandsFreePage() {
           <button
             type="button"
             className={`w-full rounded-2xl px-5 py-3 text-base font-semibold text-white shadow-sm transition active:scale-[0.98] ${guidanceOn ? "bg-slate-700 hover:bg-slate-800" : "bg-primary hover:bg-primaryDark"}`}
-            onClick={handleGuidanceToggle}
+            onClick={() => {
+              void handleGuidanceToggle();
+            }}
             disabled={isAdvancing || isTransitioning}
           >
             {guidanceOn ? "Turn Off AI Rivi Guidance" : "Enable AI Rivi Guidance"}

@@ -3,17 +3,28 @@ import { PUMP_CHANGE_KNOWLEDGE_BLOCK } from "@/lib/services/riviGuidanceContext"
 
 const MODEL = "gpt-4o-realtime-preview";
 const VOICE = "alloy";
-const INSTRUCTIONS = `You are Rivi, a calm and supportive caregiver assistant that helps people follow guardian instructions step-by-step.
-Prioritize guardian-uploaded protocol first, then use general pump-change knowledge only to supplement.
-If anything is unclear or safety-sensitive, recommend checking with the guardian.
 
-${PUMP_CHANGE_KNOWLEDGE_BLOCK}`;
+const INSTRUCTIONS = `
+You are Rivi, a calm and supportive caregiver assistant that helps people follow guardian instructions step-by-step.
+
+Rules:
+- Guardian protocol instructions are always the highest priority.
+- Use general pump-change knowledge only to supplement guardian instructions.
+- If anything is unclear or safety-sensitive, recommend checking with the guardian.
+- Speak in a calm, supportive tone.
+
+${PUMP_CHANGE_KNOWLEDGE_BLOCK}
+`;
 
 export async function POST() {
   const apiKey = process.env.OPENAI_API_KEY;
 
   if (!apiKey) {
-    return NextResponse.json({ error: "OPENAI_API_KEY is not configured." }, { status: 503 });
+    console.error("OPENAI_API_KEY missing");
+    return NextResponse.json(
+      { error: "OPENAI_API_KEY is not configured." },
+      { status: 500 }
+    );
   }
 
   try {
@@ -31,14 +42,19 @@ export async function POST() {
       })
     });
 
+    const data = await response.json();
+
     if (!response.ok) {
-      const errorBody = await response.text();
-      return NextResponse.json({ error: "Failed to create realtime session.", details: errorBody }, { status: 502 });
+      console.error("Realtime session error:", data);
+      return NextResponse.json(data, { status: 500 });
     }
 
-    const data = await response.json();
     return NextResponse.json(data);
-  } catch {
-    return NextResponse.json({ error: "Unable to reach OpenAI realtime sessions API." }, { status: 502 });
+  } catch (err) {
+    console.error("Realtime session exception:", err);
+    return NextResponse.json(
+      { error: "Failed to create realtime session." },
+      { status: 500 }
+    );
   }
 }

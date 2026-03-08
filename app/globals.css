@@ -291,6 +291,19 @@ textarea:focus-visible {
   animation: guidanceFabPulse 1100ms cubic-bezier(0.2, 0.8, 0.2, 1) infinite;
 }
 
+.guidance-fab-connecting {
+  background: #3f6c8f;
+  animation: guidanceFabPulse 1300ms cubic-bezier(0.2, 0.8, 0.2, 1) infinite;
+}
+
+.guidance-fab-speaking {
+  background: #485c9c;
+}
+
+.guidance-fab-error {
+  background: #b94a63;
+}
+
 .guidance-fab-label {
   border-radius: 9999px;
   background: rgba(255, 255, 255, 0.96);

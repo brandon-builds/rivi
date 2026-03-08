@@ -2,7 +2,9 @@
 
 import { ChangeEvent, FormEvent, useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
+import { FloatingAskRivi } from "@/components/FloatingAskRivi";
 import { Toast } from "@/components/Toast";
+import { useRiviRealtimeAssistant } from "@/lib/hooks/useRiviRealtimeAssistant";
 import { GuardianStepStore } from "@/lib/stores/guardianStepStore";
 import { GuardianStep } from "@/lib/types";
 import { makeId } from "@/lib/utils/id";
@@ -37,6 +39,11 @@ export default function GuardianSetupPage() {
   const [editingStepId, setEditingStepId] = useState<string | null>(null);
   const [showSavedToast, setShowSavedToast] = useState(false);
   const router = useRouter();
+
+  const assistant = useRiviRealtimeAssistant({
+    steps,
+    currentStepId: editingStepId ?? steps[0]?.id
+  });
 
   useEffect(() => {
     setSteps(GuardianStepStore.loadSteps());
@@ -179,6 +186,7 @@ export default function GuardianSetupPage() {
 
   return (
     <>
+      <audio ref={assistant.remoteAudioRef} autoPlay playsInline hidden />
       <main className="app-shell">
         <section className="mb-4 flex items-center justify-between">
           <button type="button" className="btn-secondary px-4" onClick={() => router.push("/")}>
@@ -283,6 +291,14 @@ export default function GuardianSetupPage() {
       </main>
 
       <Toast message="Saved!" visible={showSavedToast} />
+      <FloatingAskRivi
+        state={assistant.voiceState}
+        onTap={() => {
+          void assistant.tapWidget();
+        }}
+        disabled={!assistant.realtimeSupported || assistant.voiceState === "connecting"}
+        visible
+      />
     </>
   );
 }
